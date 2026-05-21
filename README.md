@@ -31,8 +31,6 @@ VISBOX — биометрическая система контроля дост
 
     config.py: Файл конфигурации, содержащий параметры цветовой схемы графического интерфейса и пороговые значения фильтров liveness-анализа.
 
-English (VISBOX Description)
-
 VISBOX is a biometric access control framework featuring a multi-tiered liveness detection (Anti-Spoofing) pipeline. Engineered to operate on standard RGB webcams without relying on infrared sensors or depth hardware.
 Tech Stack & Core Mechanics
 
