@@ -25,6 +25,7 @@ class FaceScannerWidget(tk.Frame):
         # RU: Инженерные константы и временные пороги СКУД
         # EN: Engine tuning parameters and system timeout metrics
         self.TRACKING_TIMEOUT = 2.50
+        self.DETECTION_HOLD_TIMEOUT = 0.85
         self.IDENTITY_LOCK_TIMEOUT = 2.50
         self.POSE_ASYMMETRY_THRESH = 1.45  
         self.threshold = 75.0
@@ -46,6 +47,7 @@ class FaceScannerWidget(tk.Frame):
         
         self.fps_frame_idx = 0
         self.last_face_seen_timestamp = 0.0
+        self.last_detection_timestamp = 0.0
         self.last_tracked_identity = None
         self.last_tracked_timestamp = 0.0
         self.current_face_state = "NONE"
@@ -213,11 +215,16 @@ class FaceScannerWidget(tk.Frame):
                 
                 self.cached_identities = processed_identities
                 self.last_face_seen_timestamp = current_time
+                self.last_detection_timestamp = current_time
             else:
-                self.cached_locations = []
-                self.cached_identities = []
-                self.cached_landmarks = []
-                self.last_tracked_identity = None
+                is_recent_detector_gap = (current_time - self.last_detection_timestamp) < self.DETECTION_HOLD_TIMEOUT
+                if self.cached_locations and is_recent_detector_gap:
+                    self.last_face_seen_timestamp = current_time
+                else:
+                    self.cached_locations = []
+                    self.cached_identities = []
+                    self.cached_landmarks = []
+                    self.last_tracked_identity = None
                     
             self.is_recognizing = False
         except queue.Empty: pass
@@ -266,6 +273,8 @@ class FaceScannerWidget(tk.Frame):
                 landmarks = []
             if len(landmarks) == len(self.cached_locations):
                 self.cached_landmarks = landmarks
+                self.last_face_seen_timestamp = current_time
+                self.last_detection_timestamp = current_time
             else:
                 self.cached_landmarks = []
             
