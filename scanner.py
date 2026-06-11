@@ -34,6 +34,8 @@ class FaceScannerWidget(tk.Frame):
         self.bio_ear_history = {}          # RU: Хронология EAR (Глаза) | EN: Eye Aspect Ratio tracker
         self.bio_smile_history = {}        # RU: Хронология Z-score губ | EN: Lips extension vector log
         self.bio_eye_positions = {}        # RU: Точки век (Анти-Палец) | EN: Absolute eye landmarks positions
+        self.bio_eye_jump_failures = {}     # RU: Счетчик шумных скачков век | EN: Noisy eyelid jump counter
+        self.bio_texture_failures = {}      # RU: Счетчик сомнительных LBP кадров | EN: Suspicious texture frame counter
         self.bio_cooldown_until = 0.0      # RU: Блокировка при атаке | EN: Spoofing defense sleep lockout timer
         
         # RU: Триггеры фиксации подтвержденных фаз мимических тестов
@@ -99,6 +101,14 @@ class FaceScannerWidget(tk.Frame):
         if not identity or identity.get("id") is None:
             return None
         return (identity.get("id"), identity.get("status"), identity.get("name"))
+
+    def _is_enrolling_context(self):
+        p = self.master
+        while p and p != self:
+            if getattr(p, "is_enrolling", False):
+                return True
+            p = getattr(p, 'master', None)
+        return False
 
     def face_recognition_worker(self):
         """
@@ -214,7 +224,7 @@ class FaceScannerWidget(tk.Frame):
 
         # RU: Дросселирование нейросети: отправка кадра на анализ каждый 4-й фрейм вебкамеры
         # EN: Framework network frame throttling: push source frame array to input workspace queue every 4th cycle
-        if self.fps_frame_idx % 4 == 0 and not self.is_recognizing:
+        if self.fps_frame_idx % 4 == 0 and not self.is_recognizing and not self._is_enrolling_context():
             if self.recognition_queue.empty():
                 self.is_recognizing = True
                 self.recognition_queue.put(rgb_full_frame)
@@ -230,6 +240,7 @@ class FaceScannerWidget(tk.Frame):
                 # RU: Зачистка ОЗУ-контекста текущей сессии
                 # EN: Instantly purge temporary evaluation vectors history and memory context blocks
                 self.bio_ear_history, self.bio_smile_history, self.bio_eye_positions = {}, {}, {}
+                self.bio_eye_jump_failures, self.bio_texture_failures = {}, {}
                 self.bio_recent_smiles, self.bio_recent_blinks, self.bio_liveness_passed = {}, {}, {}
                 self.cached_locations, self.cached_identities, self.cached_landmarks = [], [], []
                 self.last_tracked_identity = None
@@ -280,13 +291,8 @@ class FaceScannerWidget(tk.Frame):
                             
                             # RU: Обход: разрешаем поворот, если этот экземпляр сканера запущен внутри окна регистрации
                             # EN: Intercept check: clear head turning block parameter flags if node parent is EnrollClientWidget
-                            p = self.master
-                            while p and p != self:
-                                from enroll_client import EnrollClientWidget
-                                if isinstance(p, EnrollClientWidget) and p.is_enrolling:
-                                    is_head_turned = False
-                                    break
-                                p = getattr(p, 'master', None)
+                            if self._is_enrolling_context():
+                                is_head_turned = False
                     
                     # ==============================================================================
                     # КОМПЛЕКС ВЕРИФИКАЦИИ ЖИВОГО ЧЕЛОВЕКА (LIVENESS ENGINE PIPELINE)
@@ -310,6 +316,8 @@ class FaceScannerWidget(tk.Frame):
                             if liveness_key not in self.bio_ear_history: self.bio_ear_history[liveness_key] = []
                             if liveness_key not in self.bio_smile_history: self.bio_smile_history[liveness_key] = []
                             if liveness_key not in self.bio_eye_positions: self.bio_eye_positions[liveness_key] = []
+                            if liveness_key not in self.bio_eye_jump_failures: self.bio_eye_jump_failures[liveness_key] = 0
+                            if liveness_key not in self.bio_texture_failures: self.bio_texture_failures[liveness_key] = 0
                             
                             self.bio_ear_history[liveness_key].append(ear)
                             self.bio_smile_history[liveness_key].append(norm_smile)
@@ -326,40 +334,49 @@ class FaceScannerWidget(tk.Frame):
                                 # А) ЦЕНЗ ТЕКСТУРЫ КОЖИ LBP (ЗАЩИТА ОТ ЭКРАНОВ ТЕЛЕФОНОВ / REPLAY ATTACK)
                                 texture_points = marks['left_eye'] + marks['right_eye'] + marks['nose_bridge']
                                 is_genuine_skin = core.analyze_texture_lbp(frame, texture_points)
-                                
                                 if is_genuine_skin:
-                                    # Б) Eye Continuity Guard: Если точки век скакнули > 14 пикселей (перекрытие пальцем) - бан сессии
-                                    # EN: Eye Continuity Guard: Anomalous point shift step delta > 14px triggers active input freeze
-                                    is_eye_continuous = True
-                                    if len(self.bio_eye_positions[liveness_key]) >= 2:
-                                        jump = np.max(np.abs(self.bio_eye_positions[liveness_key][-1] - self.bio_eye_positions[liveness_key][-2]))
-                                        if jump > 14.0: is_eye_continuous = False
-                                    
-                                    if is_eye_continuous:
-                                        ear_median = np.median(ear_arr)
-                                        # RU: Моргание - падение EAR ниже 76% от индивидуальной скользящей медианы Ивана
-                                        # EN: Blink sequence verification: current EAR value drop below 76% threshold level
-                                        if ear < (ear_median * 0.76):  
-                                            self.bio_recent_blinks[liveness_key] = current_time
-                                    else:
-                                        # RU: Палец обнаружен: аварийный сброс буферов и штрафной таймаут
-                                        # EN: Occlusion detected: lock tracking context and enforce penalty cooldown window
-                                        self.bio_cooldown_until = current_time + 1.5
-                                        self.bio_ear_history[liveness_key] = []
-                                    
-                                    # В) УЛЫБКА: Оценка отклонения Z-score относительно личной дисперсии рта человека
-                                    # EN: SMILE VERIFICATION: Analytical evaluation of current data displacement variance via Z-score
-                                    smile_mean = np.mean(smile_arr[:-1])
-                                    smile_std = np.std(smile_arr[:-1])
-                                    
-                                    if smile_std > 0.0001:
-                                        z_score = (norm_smile - smile_mean) / smile_std
-                                        # RU: Живой мимический всплеск ($Z > 2.0$) при условии закрытых зубов ($mar < 0.25$)
-                                        # EN: Muscle acceleration burst threshold check ($Z > 2.0$) with mouth closure verified ($mar < 0.25$)
-                                        if z_score > 2.0 and mar < 0.25:
-                                            self.bio_recent_smiles[liveness_key] = current_time
+                                    self.bio_texture_failures[liveness_key] = 0
                                 else:
-                                    self.bio_smile_history[liveness_key] = []
+                                    self.bio_texture_failures[liveness_key] += 1
+                                
+                                # LBP is advisory on noisy RGB webcams; gestures remain the primary liveness proof.
+                                # Б) Eye Continuity Guard: Если точки век скакнули > 14 пикселей (перекрытие пальцем) - бан сессии
+                                # EN: Eye Continuity Guard: Anomalous point shift step delta > 14px triggers active input freeze
+                                is_eye_continuous = True
+                                if len(self.bio_eye_positions[liveness_key]) >= 2:
+                                    jump = np.max(np.abs(self.bio_eye_positions[liveness_key][-1] - self.bio_eye_positions[liveness_key][-2]))
+                                    normalized_jump = jump / face_basis
+                                    if normalized_jump > 0.22:
+                                        self.bio_eye_jump_failures[liveness_key] += 1
+                                    else:
+                                        self.bio_eye_jump_failures[liveness_key] = 0
+                                    if self.bio_eye_jump_failures[liveness_key] >= 3:
+                                        is_eye_continuous = False
+                                
+                                if is_eye_continuous:
+                                    ear_median = np.median(ear_arr)
+                                    # RU: Моргание - падение EAR ниже 76% от индивидуальной скользящей медианы Ивана
+                                    # EN: Blink sequence verification: current EAR value drop below 76% threshold level
+                                    if ear < (ear_median * 0.76):  
+                                        self.bio_recent_blinks[liveness_key] = current_time
+                                else:
+                                    # RU: Палец обнаружен: аварийный сброс буферов и штрафной таймаут
+                                    # EN: Occlusion detected: lock tracking context and enforce penalty cooldown window
+                                    self.bio_cooldown_until = current_time + 0.75
+                                    self.bio_eye_jump_failures[liveness_key] = 0
+                                    self.bio_ear_history[liveness_key] = self.bio_ear_history[liveness_key][-6:]
+                                
+                                # В) УЛЫБКА: Оценка отклонения Z-score относительно личной дисперсии рта человека
+                                # EN: SMILE VERIFICATION: Analytical evaluation of current data displacement variance via Z-score
+                                smile_mean = np.mean(smile_arr[:-1])
+                                smile_std = np.std(smile_arr[:-1])
+                                
+                                if smile_std > 0.0001:
+                                    z_score = (norm_smile - smile_mean) / smile_std
+                                    # RU: Живой мимический всплеск ($Z > 2.0$) при условии закрытых зубов ($mar < 0.25$)
+                                    # EN: Muscle acceleration burst threshold check ($Z > 2.0$) with mouth closure verified ($mar < 0.25$)
+                                    if z_score > 2.0 and mar < 0.25:
+                                        self.bio_recent_smiles[liveness_key] = current_time
 
                 # RU: Временной кластер: оба жеста должны быть зафиксированы в окне 2.5 секунды
                 # EN: Temporal clustering logic check: track both actions markers flags validity across a strict 2.5s window

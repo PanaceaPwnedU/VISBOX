@@ -119,7 +119,9 @@ class EnrollClientWidget(tk.Frame):
             return
         
         rgb = np.ascontiguousarray(frame[:, :, ::-1])
-        locs_large = face_recognition.face_locations(rgb, model="hog")
+        small_rgb = cv2.resize(rgb, (0, 0), fx=0.5, fy=0.5)
+        locs_small = face_recognition.face_locations(small_rgb, model="hog")
+        locs_large = [(t*2, r*2, b*2, l*2) for (t, r, b, l) in locs_small]
         
         if len(locs_large) == 0:
             self.status_label.config(text="ERROR: NO FACE FOUND (Look straight at the camera)", fg=ERROR)
