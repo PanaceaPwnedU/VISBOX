@@ -50,6 +50,7 @@ class FaceScannerWidget(tk.Frame):
         
         # RU: Очереди межпоточного взаимодействия (Блокировка пула памяти кадров)
         # EN: Non-blocking inter-thread process queues for isolating memory heap frames allocation
+        self.known_faces_lock = threading.RLock()
         self.known_encodings, self.known_users = core.load_known_faces()
         self.recognition_queue = queue.Queue(maxsize=1) # RU: Вход нейросети | EN: Input pipeline queue
         self.results_queue = queue.Queue()             # RU: Выход нейросети | EN: Output pipeline queue
@@ -87,7 +88,17 @@ class FaceScannerWidget(tk.Frame):
         self.update_scanner()
 
     def reload_vectors(self):
-        self.known_encodings, self.known_users = core.load_known_faces()
+        known_encodings, known_users = core.load_known_faces()
+        with self.known_faces_lock:
+            self.known_encodings, self.known_users = known_encodings, known_users
+
+    def _unknown_identity(self):
+        return {"id": None, "name": "Unknown", "status": "unknown", "percent": 0.0}
+
+    def _liveness_key(self, identity):
+        if not identity or identity.get("id") is None:
+            return None
+        return (identity.get("id"), identity.get("status"), identity.get("name"))
 
     def face_recognition_worker(self):
         """
@@ -96,40 +107,54 @@ class FaceScannerWidget(tk.Frame):
         """
         while True:
             rgb_full_frame = self.recognition_queue.get() # RU: Извлечение кадра | EN: Read queue chunk
-            if rgb_full_frame is None: break
-            
-            # RU: Оптимизация скорости: поиск координат лица на сжатом в 2 раза кадре
-            # EN: Speed optimization block: search face coordinates on a 0.5x scaled down frame matrix
-            small_frame = cv2.resize(rgb_full_frame, (0, 0), fx=0.5, fy=0.5)
-            loc_small = face_recognition.face_locations(small_frame, model="hog")
-            # RU: Трансляция координат окна обратно в исходный размер 640x480 (Без потери точности вектора)
-            # EN: Project vector boundaries back onto the native uncompressed 640x480 frame space
-            loc_large = [(t*2, r*2, b*2, l*2) for (t, r, b, l) in loc_small]
-            
-            identities = []
-            if loc_large:
-                # RU: Тяжелый расчет дескрипторов лица на исходном несжатом кадре
-                # EN: Compute high-precision facial features descriptors on the native raw frame data
-                face_encodings = face_recognition.face_encodings(rgb_full_frame, loc_large)
-                for face_encoding in face_encodings:
-                    identity = {"id": None, "name": "Unknown", "status": "unknown", "percent": 0.0}
-                    if self.known_encodings:
-                        # RU: Вычисление евклидова расстояния до всех эталонов в ОЗУ
-                        # EN: Compute Euclidean spatial vector distances across all preloaded profiles
-                        dists = face_recognition.face_distance(self.known_encodings, face_encoding)
-                        b_idx = np.argmin(dists)
-                        min_dist = dists[b_idx]
-                        if min_dist < 0.48: # RU: Порог отсечения СКУД | EN: PACS distance confidence filter
-                            percent = round(max(0, 100 - (min_dist / 0.48) * 40), 1)
-                            if percent >= self.threshold:
-                                identity["id"] = self.known_users[b_idx][0]
-                                identity["name"] = self.known_users[b_idx][1]
-                                identity["status"] = self.known_users[b_idx][2]
-                                identity["percent"] = percent
-                    identities.append(identity)
-            # RU: Передача результатов в поток отрисовки | EN: Direct calculation data drop to results UI queue
-            self.results_queue.put((loc_large, identities))
-            self.recognition_queue.task_done()
+            try:
+                if rgb_full_frame is None:
+                    break
+                
+                # RU: Оптимизация скорости: поиск координат лица на сжатом в 2 раза кадре
+                # EN: Speed optimization block: search face coordinates on a 0.5x scaled down frame matrix
+                small_frame = cv2.resize(rgb_full_frame, (0, 0), fx=0.5, fy=0.5)
+                loc_small = face_recognition.face_locations(small_frame, model="hog")
+                # RU: Трансляция координат окна обратно в исходный размер 640x480 (Без потери точности вектора)
+                # EN: Project vector boundaries back onto the native uncompressed 640x480 frame space
+                loc_large = [(t*2, r*2, b*2, l*2) for (t, r, b, l) in loc_small]
+                
+                identities = []
+                if loc_large:
+                    # RU: Тяжелый расчет дескрипторов лица на исходном несжатом кадре
+                    # EN: Compute high-precision facial features descriptors on the native raw frame data
+                    face_encodings = face_recognition.face_encodings(rgb_full_frame, loc_large)
+                    with self.known_faces_lock:
+                        known_encodings = list(self.known_encodings) if self.known_encodings is not None else []
+                        known_users = list(self.known_users) if self.known_users is not None else []
+                    
+                    for face_encoding in face_encodings:
+                        identity = self._unknown_identity()
+                        if known_encodings and known_users:
+                            # RU: Вычисление евклидова расстояния до всех эталонов в ОЗУ
+                            # EN: Compute Euclidean spatial vector distances across all preloaded profiles
+                            dists = face_recognition.face_distance(known_encodings, face_encoding)
+                            b_idx = int(np.argmin(dists))
+                            min_dist = dists[b_idx]
+                            if min_dist < 0.48 and b_idx < len(known_users): # RU: Порог отсечения СКУД | EN: PACS distance confidence filter
+                                percent = round(max(0, 100 - (min_dist / 0.48) * 40), 1)
+                                if percent >= self.threshold:
+                                    identity["id"] = known_users[b_idx][0]
+                                    identity["name"] = known_users[b_idx][1]
+                                    identity["status"] = known_users[b_idx][2]
+                                    identity["percent"] = percent
+                        identities.append(identity)
+                
+                while len(identities) < len(loc_large):
+                    identities.append(self._unknown_identity())
+                
+                # RU: Передача результатов в поток отрисовки | EN: Direct calculation data drop to results UI queue
+                self.results_queue.put((loc_large, identities[:len(loc_large)]))
+            except Exception as exc:
+                print(f"face_recognition_worker error: {exc}", file=sys.stderr)
+                self.results_queue.put(([], []))
+            finally:
+                self.recognition_queue.task_done()
 
     def update_scanner(self):
         """
@@ -152,6 +177,9 @@ class FaceScannerWidget(tk.Frame):
             locations, identities = self.results_queue.get_nowait()
             if locations is not None and len(locations) > 0:
                 self.cached_locations = locations
+                identities = list(identities[:len(locations)])
+                while len(identities) < len(locations):
+                    identities.append(self._unknown_identity())
                 
                 # RU: Менеджер коллизий: один ID в кадре - у кого процент совпадения выше (Winner-Takes-All)
                 # EN: Conflict management pipeline: mapped IDs locked to unique higher accuracy rating match entries
@@ -166,7 +194,7 @@ class FaceScannerWidget(tk.Frame):
                 for i, identity in enumerate(identities):
                     uid = identity["id"]
                     if uid is not None and id_to_best_idx[uid] != i:
-                        identity = {"id": None, "name": "Unknown", "status": "unknown", "percent": 0.0}
+                        identity = self._unknown_identity()
                     
                     if identity["name"] != "Unknown":
                         self.last_tracked_identity = identity.copy()
@@ -176,14 +204,10 @@ class FaceScannerWidget(tk.Frame):
                 self.cached_identities = processed_identities
                 self.last_face_seen_timestamp = current_time
             else:
-                # RU: Реализация инерции имени: удерживаем трек Ивана 800мс, если он моргнул или смазал мимику
-                # EN: Runtime name inertia: locks targeted user identity tracking profile context window for 800ms
-                if self.last_tracked_identity and (current_time - self.last_tracked_timestamp) < 0.8:
-                    if self.cached_locations:
-                        self.last_face_seen_timestamp = current_time
-                else:
-                    self.cached_locations = []
-                    self.cached_identities = []
+                self.cached_locations = []
+                self.cached_identities = []
+                self.cached_landmarks = []
+                self.last_tracked_identity = None
                     
             self.is_recognizing = False
         except queue.Empty: pass
@@ -207,7 +231,7 @@ class FaceScannerWidget(tk.Frame):
                 # EN: Instantly purge temporary evaluation vectors history and memory context blocks
                 self.bio_ear_history, self.bio_smile_history, self.bio_eye_positions = {}, {}, {}
                 self.bio_recent_smiles, self.bio_recent_blinks, self.bio_liveness_passed = {}, {}, {}
-                self.cached_locations, self.cached_identities = [], []
+                self.cached_locations, self.cached_identities, self.cached_landmarks = [], [], []
                 self.last_tracked_identity = None
                 
                 # RU: Каскадный хук перерисовки таблицы логов в главном окне дешборда
@@ -224,17 +248,21 @@ class FaceScannerWidget(tk.Frame):
         if self.cached_locations:
             # RU: Извлечение 68 ключевых точек геометрии лица (Landmarks)
             # EN: Extract 68 critical spatial facial point coordinates mappings vectors array
-            landmarks = face_recognition.face_landmarks(rgb_full_frame, self.cached_locations)
-            if landmarks: self.cached_landmarks = landmarks
+            try:
+                landmarks = face_recognition.face_landmarks(rgb_full_frame, self.cached_locations)
+            except Exception as exc:
+                print(f"face_landmarks error: {exc}", file=sys.stderr)
+                landmarks = []
+            if len(landmarks) == len(self.cached_locations):
+                self.cached_landmarks = landmarks
+            else:
+                self.cached_landmarks = []
             
             for i, identity in enumerate(self.cached_identities):
                 if i >= len(self.cached_locations): break
                 d_name = identity["name"]
-                
-                is_known = (d_name != "Unknown") or (self.last_tracked_identity is not None and (current_time - self.last_tracked_timestamp) < 0.8)
-                if is_known and self.last_tracked_identity:
-                    d_name = self.last_tracked_identity["name"]
-                    identity = self.last_tracked_identity
+                liveness_key = self._liveness_key(identity)
+                is_known = liveness_key is not None
                 
                 b_color, b_name = (128, 128, 128), "Unknown"
                 is_head_turned = False
@@ -279,21 +307,21 @@ class FaceScannerWidget(tk.Frame):
                             
                             # RU: Наполнение кольцевых буферов хронологии параметров
                             # EN: Push values data directly into system temporal analytics memory logs
-                            if d_name not in self.bio_ear_history: self.bio_ear_history[d_name] = []
-                            if d_name not in self.bio_smile_history: self.bio_smile_history[d_name] = []
-                            if d_name not in self.bio_eye_positions: self.bio_eye_positions[d_name] = []
+                            if liveness_key not in self.bio_ear_history: self.bio_ear_history[liveness_key] = []
+                            if liveness_key not in self.bio_smile_history: self.bio_smile_history[liveness_key] = []
+                            if liveness_key not in self.bio_eye_positions: self.bio_eye_positions[liveness_key] = []
                             
-                            self.bio_ear_history[d_name].append(ear)
-                            self.bio_smile_history[d_name].append(norm_smile)
-                            self.bio_eye_positions[d_name].append(current_eye_pos)
+                            self.bio_ear_history[liveness_key].append(ear)
+                            self.bio_smile_history[liveness_key].append(norm_smile)
+                            self.bio_eye_positions[liveness_key].append(current_eye_pos)
                             
-                            if len(self.bio_ear_history[d_name]) > 40: self.bio_ear_history[d_name].pop(0)
-                            if len(self.bio_smile_history[d_name]) > 40: self.bio_smile_history[d_name].pop(0)
-                            if len(self.bio_eye_positions[d_name]) > 5: self.bio_eye_positions[d_name].pop(0)
+                            if len(self.bio_ear_history[liveness_key]) > 40: self.bio_ear_history[liveness_key].pop(0)
+                            if len(self.bio_smile_history[liveness_key]) > 40: self.bio_smile_history[liveness_key].pop(0)
+                            if len(self.bio_eye_positions[liveness_key]) > 5: self.bio_eye_positions[liveness_key].pop(0)
                             
-                            if len(self.bio_ear_history[d_name]) >= 12:
-                                ear_arr = np.array(self.bio_ear_history[d_name])
-                                smile_arr = np.array(self.bio_smile_history[d_name])
+                            if len(self.bio_ear_history[liveness_key]) >= 12:
+                                ear_arr = np.array(self.bio_ear_history[liveness_key])
+                                smile_arr = np.array(self.bio_smile_history[liveness_key])
                                 
                                 # А) ЦЕНЗ ТЕКСТУРЫ КОЖИ LBP (ЗАЩИТА ОТ ЭКРАНОВ ТЕЛЕФОНОВ / REPLAY ATTACK)
                                 texture_points = marks['left_eye'] + marks['right_eye'] + marks['nose_bridge']
@@ -303,8 +331,8 @@ class FaceScannerWidget(tk.Frame):
                                     # Б) Eye Continuity Guard: Если точки век скакнули > 14 пикселей (перекрытие пальцем) - бан сессии
                                     # EN: Eye Continuity Guard: Anomalous point shift step delta > 14px triggers active input freeze
                                     is_eye_continuous = True
-                                    if len(self.bio_eye_positions[d_name]) >= 2:
-                                        jump = np.max(np.abs(self.bio_eye_positions[d_name][-1] - self.bio_eye_positions[d_name][-2]))
+                                    if len(self.bio_eye_positions[liveness_key]) >= 2:
+                                        jump = np.max(np.abs(self.bio_eye_positions[liveness_key][-1] - self.bio_eye_positions[liveness_key][-2]))
                                         if jump > 14.0: is_eye_continuous = False
                                     
                                     if is_eye_continuous:
@@ -312,12 +340,12 @@ class FaceScannerWidget(tk.Frame):
                                         # RU: Моргание - падение EAR ниже 76% от индивидуальной скользящей медианы Ивана
                                         # EN: Blink sequence verification: current EAR value drop below 76% threshold level
                                         if ear < (ear_median * 0.76):  
-                                            self.bio_recent_blinks[d_name] = current_time
+                                            self.bio_recent_blinks[liveness_key] = current_time
                                     else:
                                         # RU: Палец обнаружен: аварийный сброс буферов и штрафной таймаут
                                         # EN: Occlusion detected: lock tracking context and enforce penalty cooldown window
                                         self.bio_cooldown_until = current_time + 1.5
-                                        self.bio_ear_history[d_name] = []
+                                        self.bio_ear_history[liveness_key] = []
                                     
                                     # В) УЛЫБКА: Оценка отклонения Z-score относительно личной дисперсии рта человека
                                     # EN: SMILE VERIFICATION: Analytical evaluation of current data displacement variance via Z-score
@@ -329,20 +357,20 @@ class FaceScannerWidget(tk.Frame):
                                         # RU: Живой мимический всплеск ($Z > 2.0$) при условии закрытых зубов ($mar < 0.25$)
                                         # EN: Muscle acceleration burst threshold check ($Z > 2.0$) with mouth closure verified ($mar < 0.25$)
                                         if z_score > 2.0 and mar < 0.25:
-                                            self.bio_recent_smiles[d_name] = current_time
+                                            self.bio_recent_smiles[liveness_key] = current_time
                                 else:
-                                    self.bio_smile_history[d_name] = []
+                                    self.bio_smile_history[liveness_key] = []
 
                 # RU: Временной кластер: оба жеста должны быть зафиксированы в окне 2.5 секунды
                 # EN: Temporal clustering logic check: track both actions markers flags validity across a strict 2.5s window
-                has_smiled_recently = (current_time - self.bio_recent_smiles.get(d_name, 0)) < 2.5
-                has_blinked_recently = (current_time - self.bio_recent_blinks.get(d_name, 0)) < 2.5
-                if has_smiled_recently and has_blinked_recently: self.bio_liveness_passed[d_name] = True
+                has_smiled_recently = liveness_key is not None and (current_time - self.bio_recent_smiles.get(liveness_key, 0)) < 2.5
+                has_blinked_recently = liveness_key is not None and (current_time - self.bio_recent_blinks.get(liveness_key, 0)) < 2.5
+                if liveness_key is not None and has_smiled_recently and has_blinked_recently: self.bio_liveness_passed[liveness_key] = True
                 
                 # ==============================================================================
                 # УПРАВЛЕНИЕ СТЕЙТ-МАШИНОЙ И ЗАПИСЬ ЖУРНАЛОВ СКУД (DASHBOARD STATE SYNCHRONIZATION)
                 # ==============================================================================
-                has_passed_liveness = self.bio_liveness_passed.get(d_name, False)
+                has_passed_liveness = liveness_key is not None and self.bio_liveness_passed.get(liveness_key, False)
                 if i == 0:
                     if is_known:
                         if not has_passed_liveness:

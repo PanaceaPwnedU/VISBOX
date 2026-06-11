@@ -73,6 +73,11 @@ class EnrollClientWidget(tk.Frame):
         def proceed():
             name = entry.get().strip()
             if name:
+                if self.user_name_exists(name):
+                    messagebox.showerror("Error", f"Employee '{name}' already exists")
+                    entry.focus()
+                    entry.select_range(0, tk.END)
+                    return
                 self.is_enrolling = True
                 self.enroll_name = name
                 self.enroll_stage_idx = 0
@@ -91,38 +96,73 @@ class EnrollClientWidget(tk.Frame):
         
         dialog.grab_set() # Перехватываем глобальный фокус ввода
 
+    def user_name_exists(self, name, cursor=None):
+        """Проверяет имя без учета регистра, чтобы не заводить дубликаты операторов."""
+        conn = None
+        if cursor is None:
+            conn = sqlite3.connect(core.DB_NAME)
+            cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM users WHERE LOWER(TRIM(name)) = LOWER(?) LIMIT 1", (name.strip(),))
+        exists = cursor.fetchone() is not None
+        if conn:
+            conn.close()
+        return exists
+
     def capture_stage_frame(self):
-        """Забирает данные из кэша импортированного сканера без повторного открытия камеры"""
+        """Забирает текущий кадр из общего потока сканера без повторного открытия камеры"""
         if not self.is_enrolling: return
         
         # Читаем текущий кадр из общего потока сканера
         ret, frame = self.scanner.cam_thread.read()
-        if not ret or frame is None: return
+        if not ret or frame is None:
+            self.status_label.config(text="ERROR: CAMERA FRAME NOT READY", fg=ERROR)
+            return
         
-        # Извлекаем координаты лица, которые сканер ПРЯМО СЕЙЧАС держит в кэше
-        locs_large = self.scanner.cached_locations
+        rgb = np.ascontiguousarray(frame[:, :, ::-1])
+        locs_large = face_recognition.face_locations(rgb, model="hog")
         
-        if len(locs_large) == 1:
-            rgb = np.ascontiguousarray(frame[:, :, ::-1])
+        if len(locs_large) == 0:
+            self.status_label.config(text="ERROR: NO FACE FOUND (Look straight at the camera)", fg=ERROR)
+            return
+        if len(locs_large) > 1:
+            self.status_label.config(text="ERROR: MULTIPLE FACES FOUND (Only one employee in frame)", fg=ERROR)
+            return
+
+        try:
             # Строим 128D вектор по точным координатам несжатого кадра
-            enc = face_recognition.face_encodings(rgb, locs_large)[0]
-            self.enroll_encodings.append(enc)
-            
-            self.enroll_stage_idx += 1
-            self.flash_counter = 4 # Триггерим эффект затвора камеры
-            
-            stages = ["STRAIGHT", "UP", "UP-RIGHT", "RIGHT", "DOWN-RIGHT", "DOWN", "DOWN-LEFT", "LEFT", "UP-LEFT"]
-            if self.enroll_stage_idx < 9:
-                self.status_label.config(text=f"[{self.enroll_name}] TURN {stages[self.enroll_stage_idx]} | PRESS SPACE", fg=ACCENT)
-            else:
-                self.save_user_to_db()
+            encodings = face_recognition.face_encodings(rgb, locs_large)
+        except Exception:
+            self.status_label.config(text="ERROR: FACE ENCODING FAILED (Try again)", fg=ERROR)
+            return
+
+        if len(encodings) != 1:
+            self.status_label.config(text="ERROR: FACE ENCODING EMPTY (Improve lighting and try again)", fg=ERROR)
+            return
+
+        self.enroll_encodings.append(encodings[0])
+        
+        self.enroll_stage_idx += 1
+        self.flash_counter = 4 # Триггерим эффект затвора камеры
+        
+        stages = ["STRAIGHT", "UP", "UP-RIGHT", "RIGHT", "DOWN-RIGHT", "DOWN", "DOWN-LEFT", "LEFT", "UP-LEFT"]
+        if self.enroll_stage_idx < 9:
+            self.status_label.config(text=f"[{self.enroll_name}] TURN {stages[self.enroll_stage_idx]} | PRESS SPACE", fg=ACCENT)
         else:
-            self.status_label.config(text="ERROR: TARGET FACE NOT MATCHED (Look straight at the camera)", fg=ERROR)
+            self.save_user_to_db()
 
     def save_user_to_db(self):
         """Записывает 9 векторов лица в базу и отправляет сигнал логам"""
         conn = sqlite3.connect(core.DB_NAME)
         cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        if self.user_name_exists(self.enroll_name, cursor):
+            conn.rollback()
+            conn.close()
+            self.is_enrolling = False
+            self.enroll_encodings = []
+            self.status_label.config(text=f"ERROR: {self.enroll_name} ALREADY EXISTS", fg=ERROR)
+            self.focus_force()
+            return
         cursor.execute("INSERT INTO users (name, status) VALUES (?, ?)", (self.enroll_name, "friend"))
         uid = cursor.lastrowid
         for enc in self.enroll_encodings:
